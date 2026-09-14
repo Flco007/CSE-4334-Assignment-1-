@@ -1,0 +1,17 @@
+name: cse4334
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - scikit-learn=1.9
+  - pandas
+  - numpy
+  - scipy
+  - matplotlib
+  - seaborn
+  - jupyterlab
+  - ipykernel
+  - openpyxl      # required to read the .xlsx source file
+  - pyarrow       # required for the Parquet cache
+  - joblib        # persisting the fitted preprocessor
+  - nbstripout    # keeps notebook diffs readable in git
