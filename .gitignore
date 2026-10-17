@@ -1,7 +1,16 @@
-data/
-artifacts/
-.ipynb_checkpoints/
+# Python / Jupyter
 __pycache__/
 *.pyc
-.DS_Store
+.ipynb_checkpoints/
 .venv/
+venv/
+
+# Generated outputs (reproducible from code)
+results/
+*.pkl
+*.joblib
+figures/cache/
+
+# OS / editor
+.DS_Store
+.vscode/
