@@ -3,8 +3,7 @@ import pandas as pd
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import (accuracy_score, precision_score, recall_score,
-                             f1_score, roc_auc_score)
+from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score, roc_auc_score)
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -17,7 +16,7 @@ COST_FN, COST_FP = 100, 10          # C(+,-), C(-,+)
 
 DATA_PATH = "data/adult.data"
 
-# the raw file has no header so we name the columns ourselves (order comes from adult.names)
+# the raw file has no header so we name the columns ourselves order comes from adult.names
 COLUMNS = ["age", "workclass", "fnlwgt", "education", "education-num",
            "marital-status", "occupation", "relationship", "race", "sex",
            "capital-gain", "capital-loss", "hours-per-week", "native-country",
@@ -41,13 +40,10 @@ def load_data(path=DATA_PATH) -> tuple[pd.DataFrame, pd.Series]:
     - drop columns listed in DROP_COLS
     Returns X (features) and y (0/1 target)."""
 
-    # we read the file with no header, strip the space after each comma,
-    # and turn every ? into a real missing value so the imputer can see it
     df = pd.read_csv(path, names=COLUMNS, header=None,
                      skipinitialspace=True, na_values="?")
 
     # we encode the target as 1 for >50K and 0 for <=50K
-    # rstrip(".") lets this also work on adult.test, where labels end with a period
     y = (df["income"].str.rstrip(".") == ">50K").astype(int)
 
     # we split off the features by dropping the target and any columns we chose to drop
@@ -60,38 +56,32 @@ def make_preprocessor() -> ColumnTransformer:
     """Return an UNFITTED Task 1 ColumnTransformer.
     Never call .fit() here. It is fitted inside each CV fold."""
 
-    # numerical part of the pipeline: fill missing with the median, then z-score scale
-    numeric = Pipeline(
+    numeric_features = [c for c in NUMERIC_COLS if c not in DROP_COLS]
+    numeric_transformer = Pipeline(
         steps=[
-            ("impute", SimpleImputer(strategy="median")),
-            ("scale", StandardScaler())]
+            ("imputer", SimpleImputer(strategy="median")), 
+            ("scaler", StandardScaler())]
     )
 
-    # categorical part of the pipeline: fill missing with the most common value, then one-hot encode
-    # handle_unknown="ignore" keeps a category seen only in a test fold from crashing the model
-    categorical = Pipeline(
+    categorical_features = [c for c in CATEGORICAL_COLS if c not in DROP_COLS]
+    categorical_transformer = Pipeline(
         steps=[
-            ("impute", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore"))]
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("encoder", OneHotEncoder(handle_unknown="ignore")),
+        ]
     )
 
-    # the column transformer runs both pipelines side by side on their own columns
-    # and glues the outputs together into one feature matrix
     return ColumnTransformer(
         transformers=[
-            ("num", numeric, [c for c in NUMERIC_COLS if c not in DROP_COLS]),
-            ("cat", categorical, [c for c in CATEGORICAL_COLS if c not in DROP_COLS])]
+            ("num", numeric_transformer, numeric_features),
+            ("cat", categorical_transformer, categorical_features),
+        ]
     )
 
 
 # ---------- Task 2: evaluation harness (step 2) ----------
 def evaluate(pipeline, X, y) -> dict:
-    """5-fold stratified CV on the FULL pipeline (preprocessor + model).
-    Returns:
-      {'metrics': {metric_name: (mean, std)},
-       'oof_proba': np.ndarray of P(+|x) for every row, out-of-fold}"""
 
-    # we keep one score per fold for each metric so we can report mean and std
     fold_scores = {m: [] for m in SCORING}
 
     # one out-of-fold probability per row, filled in as each fold is scored
@@ -103,8 +93,6 @@ def evaluate(pipeline, X, y) -> dict:
         # we clone so every fold starts from a fresh, unfitted copy of the pipeline
         model = clone(pipeline)
 
-        # fitting the whole pipeline fits the imputers, scaler and encoder
-        # (and SMOTE, if present) on this fold's training rows only, so nothing leaks
         model.fit(X.iloc[train_idx], y.iloc[train_idx])
 
         # we score on the held-out rows the model never saw
@@ -118,7 +106,6 @@ def evaluate(pipeline, X, y) -> dict:
         fold_scores["f1"].append(f1_score(y_true, pred, zero_division=0))
         fold_scores["roc_auc"].append(roc_auc_score(y_true, proba))
 
-        # we save these probabilities for the ROC curves and the Task 4 cost sweep
         oof_proba[test_idx] = proba
 
     metrics = {m: (np.mean(v), np.std(v)) for m, v in fold_scores.items()}

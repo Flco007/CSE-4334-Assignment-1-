@@ -1,0 +1,1774 @@
+===================================================================
+RIPPER, FOIL Gain, wittgenstein, and Custom scikit-learn Estimators
+===================================================================
+
+Conversation transcript, 17 October 2026
+
+CONTENTS
+========
+
+1.  The RIPPER rule-learning algorithm from scratch
+2.  FOIL information gain vs. entropy and Gini
+3.  RIPPER's class ordering and the default rule
+4.  Training RIPPER with the wittgenstein library
+5.  Wrapping a model as a scikit-learn classifier
+6.  An impute-only ColumnTransformer that returns a DataFrame
+7.  check_is_fitted, unique_labels, input types, and @property
+8.  Exporting the conversation as Markdown
+9.  Exporting the conversation as plain text
+10. Appendix: code files
+
+----------------------------------------------------------------------------------------------------
+
+1. THE RIPPER RULE-LEARNING ALGORITHM FROM SCRATCH
+==================================================
+
+  Question: Explain the RIPPER rule-learning algorithm from scratch: sequential covering, how a
+  single rule is grown and pruned, and what the optimization phase does. Use a tiny example dataset
+  to show one rule being built step by step.
+
+RIPPER (Repeated Incremental Pruning to Produce Error Reduction) was introduced by William Cohen in
+1995. It learns an ordered list of IF–THEN rules. It builds on an earlier algorithm, IREP
+(Incremental Reduced Error Pruning), and runs in three layers:
+
+1.  Sequential covering, the outer loop that learns rules one at a time.
+2.  Grow-then-prune, which builds each individual rule.
+3.  Optimization, a pass that revisits every rule after the whole rule set exists.
+
+1.1 Sequential covering (the outer loop)
+----------------------------------------
+
+Class ordering. RIPPER sorts the classes from rarest to most common. It learns rules for the rarest
+class against all the others, removes the examples those rules cover, then moves on to the next
+class. The most frequent class becomes the default rule ("ELSE predict majority"). With two classes,
+it learns rules only for the minority class and lets everything else fall through to the default.
+
+The loop, for one target class:
+
+    RuleSet = []
+    while positive examples remain:
+        split the remaining data randomly: ~2/3 grow set, ~1/3 prune set
+        R = GrowRule(grow set)
+        R = PruneRule(R, prune set)
+        add R to RuleSet
+        if the description length (DL) of RuleSet is more than 64 bits above
+           the smallest DL seen so far: stop
+        remove every example (positive AND negative) that R covers
+    simplify: walk the rules from last to first and delete any rule whose
+    removal lowers the total DL
+
+This is called "covering" because each rule claims a group of positives. Once claimed, those
+positives leave the pool, and the next rule only has to handle what is left.
+
+The stopping rule is RIPPER's first change to IREP. IREP stopped adding rules as soon as a new
+rule's error on the prune set went above 50%. Cohen found that this often stopped too early,
+especially for rare classes. RIPPER instead uses the Minimum Description Length (MDL) principle. The
+DL is the number of bits needed to encode the rule set plus the bits needed to list its exceptions,
+meaning the examples it gets wrong. A rule that removes many exceptions is worth its own encoding
+cost. A rule that only fits noise costs more bits than it saves. RIPPER stops once the DL is more
+than 64 bits worse than the best value seen so far.
+
+1.2 Growing and pruning one rule
+--------------------------------
+
+Growing: greedy specialization with FOIL gain
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Growing starts from an empty rule, IF (true) THEN positive, which covers everything. It then adds
+conditions one at a time:
+
+-   For a nominal attribute, a condition has the form A = v.
+-   For a numeric attribute, it has the form A ≤ θ or A ≥ θ, where θ ranges over the values seen in
+    the data.
+
+At each step, RIPPER picks the condition that maximizes FOIL information gain:
+
+    Gain(R0 -> R1) = p1 * ( log2( p1 / (p1 + n1) ) - log2( p0 / (p0 + n0) ) )
+
+-   p0, n0 are the positives and negatives covered by the rule before adding the condition.
+-   p1, n1 are the counts after adding it.
+
+The term in parentheses measures how much the rule's precision improved, in bits. Multiplying by p1
+rewards conditions that keep many positives. Without that factor, the grower would happily build
+very narrow rules that cover a single example.
+
+Growing stops when the rule covers no negatives in the grow set. This deliberately overfits, and
+pruning fixes that afterward.
+
+Pruning: reduced-error pruning on held-out data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Pruning uses the prune set, which the grower never saw. It considers deleting any final sequence of
+conditions. In practice that means it checks every prefix of the rule. It keeps the prefix that
+maximizes
+
+    v = (p - n) / (p + n)
+
+where p and n are the positives and negatives that prefix covers in the prune set.
+
+This metric is RIPPER's second change to IREP. IREP used (p + (N - n)) / (P + N), which is accuracy
+on the prune set. Here P and N are fixed, so this ranks rules by p - n alone. Cohen pointed out the
+problem with that. Compare a rule covering 2000 positives and 1000 negatives with a rule covering
+1000 positives and 1 negative. IREP's metric slightly prefers the first rule, even though the second
+is far more precise. The metric (p-n)/(p+n) ranks rules by precision instead, so it prefers the
+second.
+
+1.3 Worked example: building one rule
+-------------------------------------
+
+Task: Will a match be played? The attributes are Outlook, Humidity, and Windy. The data has 6 "no"
+days and 7 "yes" days, so "no" is the minority class. RIPPER learns rules for Play = no and uses
+"yes" as the default.
+
+For this walkthrough, assume the random split gave the following 8 grow and 5 prune examples.
+
+Grow set (positive = "no"):
+
+  #    Outlook    Humidity   Windy   Play
+  ---- ---------- ---------- ------- ---------
+  G1   sunny      high       no      no (+)
+  G2   sunny      high       yes     no (+)
+  G3   rain       normal     yes     no (+)
+  G4   sunny      normal     yes     yes (−)
+  G5   overcast   high       no      yes (−)
+  G6   rain       high       no      yes (−)
+  G7   overcast   normal     yes     yes (−)
+  G8   rain       normal     no      yes (−)
+
+Prune set:
+
+  #    Outlook   Humidity   Windy   Play
+  ---- --------- ---------- ------- ---------
+  P1   sunny     high       no      no (+)
+  P2   sunny     normal     yes     no (+)
+  P3   sunny     normal     no      no (+)
+  P4   sunny     high       yes     yes (−)
+  P5   rain      high       no      yes (−)
+
+Grow step 1: start from the empty rule
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The empty rule covers p0 = 3, n0 = 5, so the baseline term is log2(3/8) = -1.415.
+
+  Candidate condition   p1   n1   Gain
+  --------------------- ---- ---- ---------------------------------------------
+  Outlook = sunny       2    1    2 × (log₂(2/3) + 1.415) = 2 × 0.830 = 1.660
+  Humidity = high       2    2    2 × (−1 + 1.415) = 0.830
+  Windy = yes           2    2    0.830
+  Outlook = rain        1    2    1 × (−1.585 + 1.415) = −0.170
+  Humidity = normal     1    3    1 × (−2 + 1.415) = −0.585
+  Windy = no            1    3    −0.585
+  Outlook = overcast    0    2    covers no positives (skipped)
+
+The winner is Outlook = sunny, giving the rule IF Outlook = sunny THEN no.
+
+This rule covers G1 and G2 (positives) and G4 (a negative). It still covers a negative, so growing
+continues.
+
+Grow step 2: refine the rule
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Now p0 = 2, n0 = 1, so the baseline term is log2(2/3) = -0.585. Only G1, G2, and G4 are still in
+play.
+
+  Candidate condition   p1   n1   Gain
+  --------------------- ---- ---- -------------------------------
+  Humidity = high       2    0    2 × (0 + 0.585) = 1.170
+  Windy = no            1    0    1 × 0.585 = 0.585
+  Windy = yes           1    1    1 × (−1 + 0.585) = −0.415
+  Humidity = normal     0    1    covers no positives (skipped)
+
+The winner is Humidity = high, giving IF Outlook = sunny AND Humidity = high THEN no.
+
+This rule covers G1 and G2 and no negatives, so growing stops. Notice that "high" was added only to
+exclude the single negative G4. That is exactly the kind of condition that may not hold up on new
+data.
+
+Prune: score each prefix on the prune set
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  Prefix kept                Prune examples covered   p   n   v = (p−n)/(p+n)
+  -------------------------- ------------------------ --- --- -----------------
+  sunny ∧ high (full rule)   P1, P4                   1   1   0.00
+  sunny                      P1, P2, P3, P4           3   1   0.50
+  (empty rule)               all 5                    3   2   0.20
+
+Pruning deletes the final condition. The rule that is kept is:
+
+  R1: IF Outlook = sunny THEN Play = no
+
+On the held-out data, "high humidity" turned out to be fitting G4 specifically and did not
+generalize.
+
+Back in the outer loop
+~~~~~~~~~~~~~~~~~~~~~~
+
+RIPPER now:
+
+1.  Checks the MDL stopping criterion. R1 removes many exceptions cheaply, so it is kept.
+2.  Removes every example R1 covers, both positive and negative. That is G1, G2, G4, and P1 through
+    P4.
+
+What remains is G3 (the only remaining positive: rain, normal, windy) and the negatives G5, G6, G7,
+G8, and P5.
+
+The next iteration makes a fresh random grow/prune split of this remainder and grows R2. On data
+this small, there is a single positive left. Any rule that captures it, such as rain ∧ windy = yes,
+probably costs more bits than it saves, so MDL is likely to stop here. The learned model would then
+be:
+
+    IF Outlook = sunny THEN no
+    ELSE yes
+
+1.4 The optimization phase (what makes it "RIPPER" rather than IREP*)
+---------------------------------------------------------------------
+
+Cohen called IREP with the two changes above (the new pruning metric and MDL stopping) IREP*. RIPPER
+is IREP* followed by a global optimization pass.
+
+The reason for this pass is that rules were learned greedily and in sequence. Rule 1 was chosen
+without knowing what rules 2 through k would cover. The optimization pass revisits each rule with
+the whole rule set in view.
+
+For each rule Ri, in the order it was learned:
+
+1.  Make a fresh grow/prune split.
+2.  Build two competitors:
+    -   Replacement Ri': grow a new rule from scratch.
+    -   Revision Ri'': start from Ri and add conditions to it greedily.
+3.  Prune both competitors. Unlike IREP pruning, which scores the rule alone, this pruning chooses
+    the prefix that minimizes the error of the entire rule set R1, ..., Ri', ..., Rk on the prune
+    data. Each rule is judged by how well it works together with the others.
+4.  Keep whichever of the three versions (original, replacement, revision) gives the rule set the
+    lowest description length.
+
+After all rules have been revisited:
+
+-   If some positives are now uncovered (for example, because a revised rule became narrower), run
+    IREP* again on just those leftover positives to add more rules.
+-   Simplify again by deleting rules that increase the DL.
+
+Repeating the whole optimization pass k times gives RIPPERk. Cohen's main reported results use
+RIPPER2. Weka's implementation, JRip, also defaults to 2 optimization runs and to 3 folds with 1
+held out for pruning, which matches the 2/3 / 1/3 split.
+
+On the toy example: the optimizer would test whether something like Outlook = sunny ∧ Windy = no (a
+revision) or a completely different rule (a replacement) gives a shorter total encoding than plain
+sunny. It would keep whichever has the lowest DL.
+
+1.5 Summary
+-----------
+
+  ---------------------------------------------------------------------------------------------------
+  Stage                    Data used                Criterion                Purpose
+  ------------------------ ------------------------ ------------------------ ------------------------
+  Grow                     Grow set (~2/3)          FOIL gain, until no      Find precise conditions
+                                                    negatives covered        (deliberate overfitting)
+
+  Prune                    Prune set (~1/3)         Maximize (p−n)/(p+n)     Remove conditions that
+                                                    over prefixes            don't generalize
+
+  Stop adding rules        All data                 Stop if DL > best + 64   Don't model noise
+                                                    bits                     
+
+  Optimize (×k)            New split each time      Whole-rule-set error,    Fix greedy,
+                                                    then DL                  order-dependent choices
+  ---------------------------------------------------------------------------------------------------
+
+The overall design: each rule is fitted greedily on one part of the data and checked on another, and
+the rule set as a whole is judged by compression (MDL) rather than raw accuracy. Cohen showed that
+this matched or beat C4.5rules in accuracy while scaling roughly linearly with the number of
+examples on noisy data.
+
+References
+
+-   Cohen, W. W. (1995). Fast Effective Rule Induction. Proc. 12th International Conference on
+    Machine Learning (ICML), pp. 115–123. This is the RIPPER paper: IREP*, MDL stopping, and
+    optimization.
+-   Fürnkranz, J. & Widmer, G. (1994). Incremental Reduced Error Pruning. Proc. 11th ICML. This
+    introduced IREP.
+-   Quinlan, J. R. (1990). Learning Logical Definitions from Relations. Machine Learning 5(3). This
+    is the source of the FOIL gain metric.
+-   Weka's JRip class documentation, for the reference implementation's defaults.
+
+----------------------------------------------------------------------------------------------------
+
+2. FOIL INFORMATION GAIN VS. ENTROPY AND GINI
+=============================================
+
+  Question: What is FOIL information gain? Give the formula, define every term, and work through a
+  numeric example. Then explain how it differs from the Gini impurity and entropy that decision
+  trees use to choose splits.
+
+2.1 The formula
+---------------
+
+FOIL gain scores what happens when you add one condition (a literal) L to a rule R0, which turns it
+into the more specific rule R1 = R0 AND L:
+
+    FOIL_Gain(R0, R1) = t * ( log2( p1 / (p1 + n1) ) - log2( p0 / (p0 + n0) ) )
+
+  ---------------------------------------------------------------------------------------------------
+  Term                                              Meaning
+  ------------------------------------------------- -------------------------------------------------
+  R0                                                The rule before adding the condition
+
+  R1                                                The rule after adding the condition L
+
+  p0, n0                                            Number of positive and negative examples covered
+                                                    by R0
+
+  p1, n1                                            Number of positive and negative examples covered
+                                                    by R1
+
+  p/(p+n)                                           The rule's precision: the fraction of covered
+                                                    examples that are positive
+
+  -log2( p/(p+n) )                                  Bits needed to signal "this covered example is
+                                                    positive." Purer coverage means fewer bits
+
+  t                                                 Number of positives covered by R0 that are still
+                                                    covered by R1
+  ---------------------------------------------------------------------------------------------------
+
+About t. In Quinlan's original first-order setting, examples are variable bindings, and adding a
+literal can split one binding into several. That is why t is defined separately from p1. In
+propositional rule learners such as RIPPER, R1 covers a subset of R0's examples, so t = p1.
+
+Reading the formula. The term in parentheses is how many bits per positive example the new condition
+saves. Multiplying by t turns that into the total bits saved across all the positives the rule
+keeps. As a result, FOIL gain rewards a condition for two things at once:
+
+1.  Raising precision, through the log difference.
+2.  Keeping many positives, through the factor t.
+
+Edge cases.
+
+-   If precision goes down, the log difference is negative, so the gain is negative.
+-   If p1 = 0, the condition is useless for the rule. Learners skip it or treat its gain as 0.
+
+2.2 Worked example
+------------------
+
+Suppose the current rule R0 covers p0 = 100 positives and n0 = 400 negatives. Its precision is 0.2,
+so the baseline term is
+
+    log2(0.2) = -2.3219
+
+We compare four candidate conditions:
+
+  Condition   p1   n1    Precision   log2(precision)   Bits saved per positive   FOIL gain
+  ----------- ---- ----- ----------- ----------------- ------------------------- -------------------------
+  A           60   20    0.750       −0.4150           1.9069                    60 × 1.9069 = 114.4
+  B           10   0     1.000       0                 2.3219                    10 × 2.3219 = 23.2
+  C           90   300   0.231       −2.1155           0.2064                    90 × 0.2064 = 18.6
+  D           0    300   —           —                 —                         0 (covers no positives)
+
+What the comparison shows:
+
+-   B is perfectly pure but loses. It keeps only 10 positives. A rule learner that chose purely by
+    precision would grab it and end up with a narrow, overfit rule.
+-   C keeps the most positives but loses. It barely improves precision, so each kept positive saves
+    very little.
+-   A wins. It improves precision by almost 2 bits per positive while keeping 60 positives. This
+    balance between coverage and precision is the whole point of the formula.
+
+2.3 How it differs from entropy and Gini
+----------------------------------------
+
+Definitions
+~~~~~~~~~~~
+
+A decision tree scores a split by how much impurity goes down, averaged over all the child nodes.
+
+For a node where a fraction q of the examples are positive:
+
+    H(q)    = -q * log2(q) - (1 - q) * log2(1 - q)
+    Gini(q) = 1 - q^2 - (1 - q)^2
+
+When a parent node with N examples is split into children S_k:
+
+    Gain = Imp(parent) - SUM over children k of ( |S_k| / N ) * Imp(S_k)
+
+The same four conditions, scored as binary tree splits
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Each condition is treated as a split into "condition true" and "condition false." The parent node
+has 100 positives and 400 negatives, so its entropy is H = 0.7219 and its Gini impurity is 0.32.
+
+  Condition   True branch   False branch   Entropy gain   Gini decrease   FOIL gain
+  ----------- ------------- -------------- -------------- --------------- --------------
+  A           60+ / 20−     40+ / 380−     0.211          0.115           114.4 (best)
+  B           10+ / 0−      90+ / 400−     0.048          0.026           23.2
+  C           90+ / 300−    10+ / 100−     0.017          0.007           18.6
+  D           0+ / 300−     100+ / 100−    0.322 (best)   0.120 (best)    0 (worst)
+
+Condition D shows the key disagreement:
+
+-   The tree likes D. D cleanly separates out 300 negatives. For a tree, a pure child node is a pure
+    child node, whichever class it contains, and the other branch can be split further later.
+-   The rule learner ignores D. A rule needs a description of the positives. "If D then positive"
+    covers zero positives, so it is worthless as a rule condition.
+
+Summary of differences
+~~~~~~~~~~~~~~~~~~~~~~
+
+  -----------------------------------------------------------------------------------------------------
+                                    FOIL gain (rule learning)         Entropy / Gini gain (decision
+                                                                      trees)
+  --------------------------------- --------------------------------- ---------------------------------
+  Class treatment                   Asymmetric: only the positive     Symmetric: a pure node of either
+                                    class's precision matters         class is equally good
+
+  What is scored                    Only the covered side (the        Every child of the split,
+                                    examples where the rule fires)    weighted by its size
+
+  What happens to the rest          Uncovered examples are left for   Every branch becomes a subtree
+                                    later rules (sequential covering) that the tree must keep handling
+
+  Information measure               Surprisal of the positive class   Expected surprisal over both
+                                    only, -log2( p/(p+n) )            classes (entropy), or a quadratic
+                                                                      approximation of it (Gini)
+
+  Scale                             Absolute: bits × number of        Normalized per example: a
+                                    positives. Grows with dataset     weighted average
+                                    size                              
+
+  Effect on coverage                The factor t explicitly rewards   Coverage matters only through the
+                                    keeping many positives            child-size weights
+
+  Unit of choice                    A single literal (e.g. A = v,     A full partition of the data
+                                    x ≥ θ)                            (binary, or multiway as in C4.5)
+  -----------------------------------------------------------------------------------------------------
+
+Information-theoretic link. Entropy is the expected surprisal of the class label over all examples
+in a node. FOIL uses a single term from that family: the surprisal of the positive class, measured
+only on the covered examples. It then multiplies by the number of positives instead of averaging.
+
+How this shapes the two kinds of learner.
+
+-   Trees partition the whole input space, and every region must eventually get a label. That makes
+    symmetric impurity measures the natural choice.
+-   Separate-and-conquer rule learners only need to describe one class, a piece at a time, and they
+    let a default rule handle everything else. That makes a precision-focused, coverage-weighted
+    heuristic like FOIL the better fit.
+
+Fürnkranz and Flach's analysis in "coverage space," which plots each rule as the point (positives
+covered, negatives covered), makes this precise. Different rule-learning heuristics trade precision
+against coverage in different ways, and FOIL gain is one particular trade-off curve on that plot.
+
+References
+
+-   Quinlan, J. R. (1990). Learning Logical Definitions from Relations. Machine Learning 5(3),
+    239–266. This is the original definition of FOIL gain.
+-   Quinlan, J. R. (1986). Induction of Decision Trees. Machine Learning 1(1). Entropy-based
+    information gain (ID3); later C4.5 (1993).
+-   Breiman, L., Friedman, J., Olshen, R., & Stone, C. (1984). Classification and Regression Trees.
+    This is CART and the Gini index.
+-   Fürnkranz, J. (1999). Separate-and-Conquer Rule Learning. Artificial Intelligence Review 13(1).
+    A survey of rule-learning heuristics, including FOIL gain.
+-   Fürnkranz, J. & Flach, P. (2005). ROC 'n' Rule Learning — Towards a Better Understanding of
+    Covering Algorithms. Machine Learning 58(1). The coverage-space analysis of these heuristics.
+
+----------------------------------------------------------------------------------------------------
+
+3. RIPPER'S CLASS ORDERING AND THE DEFAULT RULE
+===============================================
+
+  Question: What is RIPPER's class ordering strategy learning rules for the rarest class first, and
+  why does it matter on imbalanced datasets? How does a rule-based model decide on a prediction when
+  no rule matches an example?
+
+3.1 The class ordering strategy
+-------------------------------
+
+How it works
+~~~~~~~~~~~~
+
+Given classes C1, C2, ..., Ck, RIPPER first sorts them by training-set frequency, from rarest to
+most common.
+
+1.  Learn rules for C1 (the rarest class). Treat C1 as positive and everything else (C2 ∪ ... ∪ Ck)
+    as negative. Run the full grow → prune → MDL-stop → optimize procedure.
+2.  Remove the examples those rules cover from the training data.
+3.  Learn rules for C2 against C3 ∪ ... ∪ Ck, using the reduced data.
+4.  Repeat until only Ck, the most frequent class, is left.
+5.  Make Ck the default. No rules are ever learned for it.
+
+The result is an ordered decision list: all rules for C1 come first, then the rules for C2, and so
+on, with ELSE predict C_k at the end.
+
+Why it matters on imbalanced data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+1. The rule learner only ever describes the positive class, so that should be the rare one.
+
+A covering algorithm describes one class and leaves everything else to the default. Consider what
+happens if you reverse the roles:
+
+-   If the majority class were positive, its region of the input space is usually large and varied,
+    so describing it takes many rules. Every rare example that falls outside those rules would land
+    in the default. Every rare example inside a majority rule's coverage would be absorbed without
+    anyone noticing.
+-   With the rare class positive, the learner's whole job is to find compact descriptions of the
+    minority. The majority, which is the "easy" answer, comes for free as the fallback.
+
+2. The heuristics would otherwise be fooled by the high base rate.
+
+Take a binary dataset with 950 majority and 50 minority examples. Look at the empty rule (which
+covers everything) under RIPPER's pruning metric v = (p-n)/(p+n) and its FOIL baseline:
+
+  Positive class                Empty rule precision   v = (p-n)/(p+n)   FOIL baseline log2(precision)
+  ----------------------------- ---------------------- ----------------- -------------------------------
+  Majority (950 pos / 50 neg)   0.95                   +0.90             −0.074
+  Minority (50 pos / 950 neg)   0.05                   −0.90             −4.32
+
+-   Majority as positive: a nearly empty rule already scores +0.90. Pruning has little reason to
+    keep the conditions that would exclude the 50 rare examples. FOIL gain is also tiny, because at
+    most 0.074 bits per example can be saved. The rare class gets swallowed as "noise."
+-   Minority as positive: the empty rule scores −0.90. There are up to 4.32 bits per positive to
+    gain, so the heuristics strongly reward conditions that isolate the rare class.
+
+3. Rare-class rules get priority when rules overlap.
+
+In a decision list, the first matching rule wins. Because rare-class rules come first, any example
+that falls in a region where classes overlap is labeled with the rare class. This tends to favor
+recall on the minority class over precision, which is usually the right trade when the minority
+class is the one you care about, as in fraud, faults, or intrusions.
+
+4. MDL favors describing the small class.
+
+A few rules describing 50 examples, plus a list of their exceptions, compresses much better than
+many rules describing 950 examples. Ordering by frequency matches the direction in which the MDL
+stopping criterion and rule-set simplification work well.
+
+5. The default prediction is the best fallback.
+
+Once the rarer classes' rules have removed their examples, what remains is mostly Ck. Predicting Ck
+for anything unmatched is the choice that minimizes training error on uncovered examples.
+
+Where it still struggles
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Ordering by frequency helps, but it does not solve severe imbalance on its own.
+
+-   Very few positives. At a 1:1000 ratio, a 2/3–1/3 split might leave only 3–4 positives in the
+    prune set. Pruning decisions then become noisy.
+-   MDL can give up. If each candidate rule covers so few positives that it costs more bits than it
+    saves, MDL may stop with zero rules. The model then collapses to "always predict majority,"
+    which gets high accuracy and zero recall.
+-   Common remedies:
+    -   Resampling: oversample the minority class or undersample the majority.
+    -   Cost-sensitive training. Cohen's original RIPPER release included a loss-ratio option for
+        weighting false positives against false negatives. Weka's JRip does not expose this, so with
+        JRip you would use resampling or a cost-sensitive wrapper instead.
+    -   Evaluating with recall, precision, PR-AUC, or F1 rather than accuracy.
+
+3.2 When no rule matches: the default rule
+------------------------------------------
+
+In RIPPER (ordered decision lists)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Prediction is a top-down scan of the list:
+
+    for rule in decision_list:          # rarest-class rules first
+        if rule.conditions(x) all hold:
+            return rule.class           # first match wins, stop scanning
+    return default_class                # nothing matched → most frequent class
+
+Every example therefore gets a prediction. The default rule is just the last entry in the list with
+an always-true condition.
+
+Worked illustration. The rules below are made up to show the mechanics. The task is network traffic,
+with classes attack (2%), probe (8%), and normal (90%).
+
+    R1: IF failed_logins ≥ 5 AND duration ≤ 2        THEN attack
+    R2: IF bytes_out ≥ 50000 AND dst_port = 4444     THEN attack
+    R3: IF distinct_ports ≥ 20                       THEN probe
+    R4: IF failed_logins ≥ 3                         THEN probe
+    R5: ELSE                                          normal
+
+  ---------------------------------------------------------------------------------------------------
+  Example                  What fires               Prediction               Why
+  ------------------------ ------------------------ ------------------------ ------------------------
+  failed_logins=6,         R1, R3, R4 all match     attack                   R1 is first, so it wins.
+  duration=1,                                                                The rarer class takes
+  distinct_ports=25                                                          priority.
+
+  failed_logins=3,         R4 only                  probe                    Normal first match
+  duration=40,                                                               
+  distinct_ports=4                                                           
+
+  failed_logins=0,         Nothing                  normal                   Falls through to the
+  bytes_out=1200,                                                            default
+  distinct_ports=2                                                           
+  ---------------------------------------------------------------------------------------------------
+
+What this means for errors: any rare-class example that the rules fail to describe falls through to
+the default. That makes it a false negative for the rare class. So recall on the minority class can
+be no higher than the coverage of its rules. This is the same reason class ordering matters, seen
+from the prediction side.
+
+Missing values. In RIPPER, a test on an attribute whose value is missing evaluates to false.
+Examples with missing values therefore tend to slide down the list toward the default.
+
+In other rule-based systems
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  ---------------------------------------------------------------------------------------------------
+  Approach                 When no rule fires       When several rules fire  Example systems
+  ------------------------ ------------------------ ------------------------ ------------------------
+  Ordered decision list    Default class at the end First match wins         RIPPER/JRip, CN2
+                           of the list                                       (ordered mode)
+
+  Default = majority of    Class with the most      Rules grouped and ranked C4.5rules
+  uncovered training cases training examples left   by class                 
+                           uncovered by all rules                            
+
+  Unordered rules with     Default class, usually   Combine evidence from    CN2 (unordered mode)
+  voting                   the overall majority     all matching rules, e.g. 
+                                                    summing their class      
+                                                    counts, or               
+                                                    Laplace-weighted votes   
+
+  Rule stretching /        Generalize rules by      Weighted by rule         FURIA (a fuzzy extension
+  partial matching         dropping conditions      certainty                of RIPPER)
+                           until one covers the                              
+                           example, then use the                             
+                           best of those                                     
+
+  Abstain                  Output "unknown" and     —                        High-stakes or
+                           route the case to a                               selective-prediction
+                           human or another model                            setups
+  ---------------------------------------------------------------------------------------------------
+
+The design choice depends on cost:
+
+-   Default rule: simple and always produces an answer, but hides how uncertain the model is.
+-   Rule stretching: gives better-informed answers on uncovered cases, at the cost of some
+    interpretability.
+-   Abstaining: honest about uncertainty. It is useful when an uncovered rare-class case is
+    expensive to mislabel as the majority class.
+
+References
+
+-   Cohen, W. W. (1995). Fast Effective Rule Induction. ICML. Covers class ordering by frequency,
+    the default class, and how missing values are handled.
+-   Rivest, R. L. (1987). Learning Decision Lists. Machine Learning 2(3). The formal decision-list
+    model.
+-   Clark, P. & Boswell, R. (1991). Rule Induction with CN2: Some Recent Improvements. EWSL.
+    Unordered rule sets and conflict resolution.
+-   Quinlan, J. R. (1993). C4.5: Programs for Machine Learning. Rule-set ordering and default class
+    selection in C4.5rules.
+-   Hühn, J. & Hüllermeier, E. (2009). FURIA: An Algorithm for Unordered Fuzzy Rule Induction. Data
+    Mining and Knowledge Discovery 19(3). Rule stretching for uncovered examples.
+-   He, H. & Garcia, E. A. (2009). Learning from Imbalanced Data. IEEE TKDE 21(9). Resampling and
+    cost-sensitive remedies.
+
+----------------------------------------------------------------------------------------------------
+
+4. TRAINING RIPPER WITH THE WITTGENSTEIN LIBRARY
+================================================
+
+  Question: How do I use the Python library wittgenstein to train a RIPPER classifier? Show how to
+  fit it with pos_class, predict, get probabilities, and print the learned ruleset. Explain how it
+  handles numeric and categorical features without one-hot encoding.
+
+I ran all of this against the current wittgenstein source (v0.3.5, from GitHub). PyPI was blocked in
+the workspace, so I couldn't install it with pip, but pip install wittgenstein is the normal route.
+The outputs below come from a synthetic churn dataset: 2,000 rows, about 19% positive, with mixed
+numeric and categorical features. The full script is ripper_demo.py (see the appendix).
+
+4.1 Fit, predict, probabilities, rules
+--------------------------------------
+
+    import wittgenstein as lw
+
+    clf = lw.RIPPER(random_state=42)   # defaults: k=2, prune_size=0.33, dl_allowance=64, n_discretize_bins=10
+
+    # Option A: one DataFrame that still contains the label column
+    clf.fit(train, class_feat="churn", pos_class="yes")
+
+    # Option B: X and y separately
+    # clf.fit(X_train, y_train, pos_class="yes")
+
+Watch out: fit() returns None. Writing lw.RIPPER().fit(...).predict(...) the sklearn way raises an
+AttributeError.
+
+Print the ruleset:
+
+    clf.out_model()                 # pretty print
+    print(clf.ruleset_)             # one-line string
+    clf.ruleset_.rules              # list of Rule objects
+    clf.selected_features_          # features the rules actually use
+
+    [[contract=month-to-month ^ payment=e-check ^ monthly_charges=>102.33 ^ support_calls=0] V
+    [contract=month-to-month ^ support_calls=2 ^ monthly_charges=>102.33] V
+    [contract=month-to-month ^ tenure_months=<9.0]]
+
+To read it: ^ means AND within a rule, and V means OR between rules. If any rule matches, the
+prediction is pos_class. If none match, the prediction is "not pos_class."
+
+Predict:
+
+    preds = clf.predict(X_test)                         # list of bool; True means "yes"
+    preds, reasons = clf.predict(X_test, give_reasons=True)
+
+give_reasons returns the rules that fired for each row:
+
+    {'tenure_months': 8, 'monthly_charges': 44.4, 'contract': 'month-to-month', ...}
+      -> True  ['[contract=month-to-month^tenure_months=<9.0]']
+
+Probabilities:
+
+    proba = clf.predict_proba(X_test)   # shape (n, 2), columns are [neg, pos]
+    proba[:, 1]                         # P(pos_class)
+
+The probabilities are not a smooth score. Each rule stores a Laplace-smoothed class frequency
+(smoothing alpha=1) computed on the training data:
+
+  Rule                                                   P(yes)
+  ------------------------------------------------------ --------
+  month-to-month ∧ e-check ∧ charges >102.33 ∧ calls=0   0.80
+  month-to-month ∧ calls=2 ∧ charges >102.33             0.65
+  month-to-month ∧ tenure <9                             0.55
+  no rule fires (uncovered rows)                         0.17
+
+A covered row gets the average of the frequencies of the rules that fired on it. An uncovered row
+gets the uncovered rate. In this run that produced only 5 distinct probability values over the whole
+test set, which is why ROC-AUC was a weak 0.575. These frequencies come from the training data, so
+they are optimistic. clf.recalibrate_proba(X_holdout, y_holdout) re-estimates them on held-out data
+without changing the rules.
+
+4.2 Numeric and categorical features without one-hot encoding
+-------------------------------------------------------------
+
+Every condition in wittgenstein has the same form, feature == value (the Cond class does
+df[df[feature] == val]). That is why one-hot encoding isn't needed:
+
+Categorical columns (strings or other non-numeric dtypes) are used directly. Each distinct value
+becomes a candidate condition, such as contract=month-to-month. This is the same as Cohen's A = v
+test.
+
+Numeric columns are discretized before learning starts:
+
+1.  Detection. A column is binned only if it is numeric and has more than n_discretize_bins unique
+    values (find_continuous_feats).
+2.  Binning. The column is cut into up to n_discretize_bins bins, using quantiles by default. The
+    outer bins are stretched to −∞ and +∞ so test values outside the training range still land in a
+    bin.
+3.  Replacement. Each value is replaced by its bin label, such as <9.0, 9.0 - 16.0, or >102.33. From
+    then on the feature is treated as categorical.
+4.  Prediction. The fitted bins are stored in clf.bin_transformer_.bins_ and applied to test data
+    automatically, so there's no leakage and nothing to apply by hand.
+
+Here are the bins this run learned for tenure_months:
+
+    ['<9.0', '9.0 - 16.0', '16.0 - 23.0', ..., '57.0 - 65.0', '>65.0']
+
+Low-cardinality integers stay categorical. support_calls is an int64 column but has fewer than 10
+distinct values, so it wasn't binned. That is why the rules contain support_calls=0 and
+support_calls=2 as exact matches. When I set n_discretize_bins=3 or 5, the column crossed the
+threshold and was binned into ranges like support_calls=1.0-2.0.
+
+How this differs from Cohen's RIPPER. The original algorithm, and Weka's JRip, test thresholds
+directly: A ≤ θ or A ≥ θ, with θ taken from any value seen in the data. wittgenstein can only pick
+one pre-made bin per condition. It can't express "tenure < 16" unless that happens to be a bin edge,
+and it can't join two adjacent bins into one condition. So n_discretize_bins matters a lot:
+
+  n_discretize_bins   Rules   Recall (yes)   Precision (yes)
+  ------------------- ------- -------------- -----------------
+  3                   6       0.179          0.404
+  5                   5       0.145          0.425
+  10 (default)        3       0.205          0.490
+  20                  2       0.034          0.500
+
+Too few bins give coarse ranges that mix the classes. Too many give tiny bins with too little
+coverage, and MDL stops after very few rules. You can tune this value with cross-validation
+(get_params and set_params are implemented). Passing n_discretize_bins=None turns binning off. That
+only makes sense if you've already binned the columns yourself; otherwise each raw numeric value
+becomes its own category.
+
+4.3 Things to know before using it for real
+-------------------------------------------
+
+-   Binary only. You pick one pos_class, and wittgenstein learns rules for that class and nothing
+    else. It does not do Cohen's rarest-first multiclass ordering. For multiclass problems, train
+    one model per class (one-vs-rest) and combine them yourself.
+-   Choose the rare class as pos_class. This follows from the class-ordering discussion earlier. The
+    rules only describe the positive class, and everything else falls through to "negative."
+-   Imbalance still hurts. At 19% positive, this run only reached 0.205 recall on "yes." There is no
+    class_weight parameter. To push recall up, oversample the minority class in the training set,
+    raise prune_size so pruning has more positives to judge with, or cap complexity with max_rules
+    and max_rule_conds and compare.
+-   Labels. pos_class must match a label value exactly ("yes", 1, True). For a boolean or 0/1 target
+    it defaults to True/1.
+
+Sources:
+
+-   imoscovitz/wittgenstein on GitHub https://github.com/imoscovitz/wittgenstein: the README, plus
+    the source I checked (ripper.py, discretize.py, base.py for Cond and predict_proba, and
+    base_functions.py for the smoothed gain and probability rates)
+-   Cohen, W. W. (1995). Fast Effective Rule Induction. ICML, for the original A ≤ θ / A ≥ θ numeric
+    tests that wittgenstein replaces with bins
+
+----------------------------------------------------------------------------------------------------
+
+5. WRAPPING A MODEL AS A SCIKIT-LEARN CLASSIFIER
+================================================
+
+  Question: How do I wrap a non-scikit-learn model as a scikit-learn compatible classifier so it
+  works inside a Pipeline, with cross_val_score, and with GridSearchCV? Explain the rules for
+  __init__, fit, predict, predict_proba, classes_, and why to inherit from ClassifierMixin and
+  BaseEstimator.
+
+I wrapped the wittgenstein RIPPER from the last answer and tested it against scikit-learn 1.9.1. It
+runs inside a Pipeline (imputer plus ColumnTransformer), with cross_val_score, and with GridSearchCV
+using step__param names. It also passes all 55 applicable checks in
+sklearn.utils.estimator_checks.check_estimator (1 is skipped because of the binary-only tag). The
+code is in ripper_sklearn.py and the tests are in test_wrapper.py (see the appendix).
+
+5.1 Why inherit from ClassifierMixin and BaseEstimator
+------------------------------------------------------
+
+    class RipperClassifier(ClassifierMixin, BaseEstimator):   # mixin first, BaseEstimator last
+
+BaseEstimator gives you the parameter machinery the rest of sklearn depends on:
+
+  ---------------------------------------------------------------------------------------------------
+  Provides                                          Used by
+  ------------------------------------------------- -------------------------------------------------
+  get_params(): reads your __init__ signature and   clone, GridSearchCV, repr
+  returns {name: getattr(self, name)}               
+
+  set_params(**p), including nested step__param     GridSearchCV and Pipeline (e.g.
+  names                                             ripper__prune_size)
+
+  __repr__ and the HTML repr                        Printing RipperClassifier(random_state=0) with
+                                                    only the non-default params shown
+
+  __sklearn_tags__()                                Validation helpers, checks, meta-estimators
+
+  validate_data support (n_features_in_,            Catching column-mismatch errors at predict time
+  feature_names_in_)                                
+
+  Pickling with a version stamp                     joblib.dump and parallel CV (n_jobs=-1)
+  ---------------------------------------------------------------------------------------------------
+
+clone is the key reason. cross_val_score and GridSearchCV never refit the object you pass them. For
+every fold and every parameter combination, they call clone(est), which runs
+type(est)(**est.get_params()) and refits that fresh copy. That is why the original pipe stays
+unfitted after cross_val_score, and why __init__ has to follow strict rules.
+
+ClassifierMixin marks the estimator as a classifier:
+
+-   It sets the tag estimator_type = "classifier", which is what is_classifier() reads. With an
+    integer cv=5, check_cv then picks StratifiedKFold instead of plain KFold. That matters a lot on
+    imbalanced data like the 19%-positive churn set.
+-   Scorers use the same tag. For example, "roc_auc" knows to call predict_proba (or
+    decision_function) and take the column for classes_[1].
+-   It supplies score(X, y) as accuracy.
+
+Order matters, and getting it wrong fails silently. BaseEstimator.__sklearn_tags__ doesn't call
+super(), so if it comes first in the MRO, the mixin's tags never get applied. I tested this:
+
+    class WrongOrder(BaseEstimator, ClassifierMixin): ...
+    is_classifier(WrongOrder())  -> False  -> CV would use KFold
+
+There's no error or warning, just unstratified folds and possibly the wrong scorer behavior.
+
+5.2 Rules for __init__
+----------------------
+
+1.  Every parameter is an explicit keyword argument with a default. get_params reads the signature
+    with inspect, so it has to see the names.
+2.  The body only does self.name = name, using exactly the same name, with no conversion.
+3.  No validation, no derived state, no data-dependent work. Those belong in fit.
+
+Here is what breaks when you violate these (each case was run):
+
+  --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  Violation                                         Result
+  ------------------------------------------------- ------------------------------------------------------------------------------------------------------------------------------
+  self.features = list(features) (converts the      clone → RuntimeError: Cannot clone object ..., as the constructor either does not set or modifies parameter features
+  value)                                            
+
+  def __init__(self, **kwargs)                      get_params() returns {}, then set_params(depth=5) → ValueError: Invalid parameter 'depth' ... Valid parameters are: []
+
+  def __init__(self, *args)                         RuntimeError: scikit-learn estimators should always specify their parameters in the signature of their __init__ (no varargs)
+
+  if alpha <= 0: raise ... inside __init__          No error, but no protection either: set_params(alpha=-5), which GridSearchCV calls, sets the attribute directly without
+                                                    running __init__, so alpha = -5 goes through unchecked
+  --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+The last case is the subtle one. Validation in __init__ looks like it works when you test it by
+hand, but every tuning path skips it.
+
+Two wrapper-specific consequences:
+
+-   Build the wrapped model in fit, never in __init__. Here that is self.model_ = lw.RIPPER(...).
+    That way every clone and every set_params value actually reaches the underlying model.
+-   Mirror the inner model's parameters as your own __init__ arguments. Just storing the inner model
+    object would hide them from GridSearchCV.
+
+5.3 Rules for fit
+-----------------
+
+    def fit(self, X, y):
+        X_checked, y = validate_data(self, X, y, dtype=None)   # validates; sets n_features_in_, feature_names_in_
+        X = self._as_frame(X, X_checked)
+        check_classification_targets(y)
+        ...
+        self.classes_, counts = np.unique(y, return_counts=True)
+        self.model_ = lw.RIPPER(k=self.k, ...)
+        self.model_.fit(X, pd.Series(y == pos), pos_class=True)
+        return self
+
+-   Validate here. validate_data checks that X is 2-D, non-empty, finite, and not sparse, that X and
+    y have the same length, and that y isn't None. Using it took me from 44/56 passing checks to
+    55/55. sklearn's checks expect specific error messages (for example "Reshape your data" for 1-D
+    X, or "Only binary classification is supported." when the tag says multi_class=False), and
+    validate_data produces them.
+-   Learned state gets a trailing underscore (classes_, model_, pos_class_). check_is_fitted looks
+    for these attributes to decide whether the estimator has been fitted.
+-   Never modify the __init__ parameters in fit. If pos_class=None means "pick the minority class,"
+    store the result as self.pos_class_. Overwriting self.pos_class would change what get_params
+    returns and break later clones.
+-   Return self. Pipelines and chaining (clf.fit(X, y).predict(X)) rely on it. wittgenstein's own
+    fit returns None, which is one more thing the wrapper fixes.
+-   Wrapper gotcha: keep the original DataFrame. check_array(dtype=None) turns a mixed-type
+    DataFrame into a single object array. wittgenstein only bins columns whose dtype is numeric, so
+    passing it that array would silently treat every numeric column as categorical. The wrapper runs
+    validation for its checks and error messages, but passes the original DataFrame to RIPPER. In
+    the pipeline, ColumnTransformer(...).set_output(transform="pandas") keeps the data a DataFrame
+    between steps.
+
+5.4 Rules for classes_
+----------------------
+
+-   Set it in fit with np.unique(y). It is sorted and holds the original labels (['no', 'yes'], not
+    [False, True]).
+-   Every output follows its order. Column j of predict_proba is the probability of classes_[j].
+-   Many tools depend on it: binary scorers treat classes_[1] as the positive class, and
+    cross_val_predict(method="predict_proba"), CalibratedClassifierCV, VotingClassifier, and
+    StackingClassifier all use it to line up columns.
+
+This is where wrappers usually go wrong. wittgenstein always returns [not-pos, pos], but if
+pos_class happens to be classes_[0], those columns are reversed relative to classes_. So the wrapper
+writes each probability into the position classes_ dictates:
+
+    proba[:, self.pos_index_]     = p_pos
+    proba[:, 1 - self.pos_index_] = 1.0 - p_pos
+
+5.5 Rules for predict and predict_proba
+---------------------------------------
+
+Both:
+
+-   Start with check_is_fitted(self), which raises NotFittedError.
+-   Then call validate_data(self, X, reset=False). With reset=False it checks the feature count and
+    names against what fit saw instead of overwriting them.
+
+predict:
+
+-   Returns a 1-D array of shape (n_samples,) whose values come from classes_, with the same labels
+    and dtype as the training y.
+-   It does not have to equal argmax(predict_proba). RIPPER predicts positive whenever any rule
+    fires, even if that rule's smoothed precision is below 0.5. The wrapper therefore uses RIPPER's
+    own rule decision, so predictions stay faithful to the readable rules.
+
+predict_proba:
+
+-   Returns shape (n_samples, n_classes), with columns in classes_ order and each row summing to 1.
+-   Only define it if the model really produces probabilities. sklearn checks with
+    hasattr(est, "predict_proba") to decide whether scoring="roc_auc" or soft voting is possible.
+
+5.6 Tags (sklearn ≥ 1.6)
+------------------------
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.classifier_tags.multi_class = False   # binary only
+        tags.input_tags.categorical = True
+        tags.input_tags.string = True
+        return tags
+
+Tags replaced the old _more_tags() method in 1.6. They tell the validation tools, meta-estimators,
+and check_estimator what your model accepts. Setting multi_class=False is what makes the checks
+expect an error on multiclass y instead of failing the estimator.
+
+5.7 Using it
+------------
+
+    pipe = Pipeline([("pre", pre), ("ripper", RipperClassifier(random_state=0))])
+
+    cross_val_score(pipe, X, y, cv=5, scoring="balanced_accuracy")   # stratified automatically
+
+    GridSearchCV(pipe, {"ripper__n_discretize_bins": [5, 10],
+                        "ripper__prune_size": [0.33, 0.5],
+                        "ripper__max_rules": [None, 4]},
+                 scoring="balanced_accuracy", cv=StratifiedKFold(4, shuffle=True, random_state=0),
+                 n_jobs=-1).fit(X, y)
+    # best: n_discretize_bins=10, prune_size=0.5, max_rules=None (CV balanced accuracy 0.539)
+
+Score with balanced_accuracy, f1, or PR-AUC here, not the default accuracy. Plain accuracy was 0.809
+on this data, which is about what "always predict no" gets at an 81/19 split. The balanced accuracy
+of about 0.53 shows the model is only slightly better than chance on this noisy synthetic set. The
+wrapper works correctly; RIPPER just has little signal to learn from in this data.
+
+Sources:
+
+-   scikit-learn: Developing scikit-learn estimators
+    https://scikit-learn.org/stable/developers/develop.html, the official rules for __init__, fit,
+    classes_, and tags
+-   scikit-learn: check_estimator / parametrize_with_checks
+    https://scikit-learn.org/stable/modules/generated/sklearn.utils.estimator_checks.check_estimator.html,
+    the compliance test suite I ran
+-   scikit-learn: Estimator tags
+    https://scikit-learn.org/stable/developers/develop.html#estimator-tags, the __sklearn_tags__ API
+    from 1.6 on
+-   scikit-learn-contrib/project-template https://github.com/scikit-learn-contrib/project-template,
+    the reference template for third-party estimators
+
+----------------------------------------------------------------------------------------------------
+
+6. AN IMPUTE-ONLY COLUMNTRANSFORMER THAT RETURNS A DATAFRAME
+============================================================
+
+  Question: In scikit-learn, how do I build a ColumnTransformer that only imputes missing values
+  (median for numeric, most frequent for categorical) and outputs a pandas DataFrame with the
+  original column names? Explain set_output(transform="pandas") and verbose_feature_names_out=False.
+
+I tested this with scikit-learn 1.9.1 and pandas 3.0.5. The full version is impute_final.py (see the
+appendix).
+
+6.1 The basic version
+---------------------
+
+    import numpy as np
+    from sklearn.compose import ColumnTransformer, make_column_selector
+    from sklearn.impute import SimpleImputer
+
+    imputer = ColumnTransformer(
+        [("num", SimpleImputer(strategy="median"),        make_column_selector(dtype_include="number")),
+         ("cat", SimpleImputer(strategy="most_frequent"), make_column_selector(dtype_exclude="number"))],
+        remainder="passthrough",            # any column not selected is kept as-is
+        verbose_feature_names_out=False,    # keep "tenure", not "num__tenure"
+    ).set_output(transform="pandas")        # return a DataFrame, not a numpy array
+
+    X_imp = imputer.fit_transform(X)
+
+Output on a 5-row test frame with a float, a string, a pandas Categorical, and a nullable Int64
+column:
+
+         tenure  charges  calls  contract  payment
+    101     1.0     20.5    0.0       m2m     card
+    102     5.0     57.5    2.0  one-year     card
+    103     8.5     70.0    1.5       m2m     card     <- tenure, calls, contract filled
+    ...
+
+-   The index is preserved (101–105).
+-   The learned fill values are in imputer.named_transformers_["num"].statistics_, which gave
+    [8.5, 57.5, 1.5], and in the "cat" imputer's statistics_, which gave ['m2m', 'card'].
+-   make_column_selector chooses columns by dtype each time fit runs, so you don't have to hard-code
+    column lists.
+-   dtype_exclude="number" picks up object, pandas 3 str, category, and bool columns.
+
+6.2 What set_output(transform="pandas") does
+--------------------------------------------
+
+By default every sklearn transformer returns a numpy array. Here that would be an object array,
+because numbers and strings are mixed, and all column names would be lost:
+
+    ndarray object [[1.0 20.5 0.0 'm2m' 'card'] ...]
+
+set_output(transform="pandas") wraps transform and fit_transform so they return a DataFrame instead:
+
+-   Columns come from get_feature_names_out().
+-   The index is taken from the input DataFrame.
+-   On a ColumnTransformer or Pipeline, the setting applies to every sub-transformer. Each inner
+    SimpleImputer returns a DataFrame too, and the ColumnTransformer concatenates them with
+    pd.concat instead of np.hstack. That is why each column keeps its own dtype (float64 for the
+    numbers, str for the strings) instead of everything turning into object.
+
+Other options:
+
+-   transform="polars" returns a polars DataFrame.
+-   transform="default" returns numpy.
+-   sklearn.set_config(transform_output="pandas") turns pandas output on globally. I checked that a
+    bare SimpleImputer then returns a DataFrame.
+
+This setting only affects transformers. A classifier's predict output doesn't change. Downstream
+steps that need real column dtypes depend on it, such as the RIPPER wrapper from the last answer.
+
+6.3 What verbose_feature_names_out=False does
+---------------------------------------------
+
+get_feature_names_out() gives the DataFrame its column names. By default (True), ColumnTransformer
+prefixes each name with its transformer's name so names from different branches can't clash:
+
+  Setting                                               Columns
+  ----------------------------------------------------- --------------------------------------------------------------------
+  True (default)                                        num__tenure, num__charges, num__calls, cat__contract, cat__payment
+  False                                                 tenure, charges, calls, contract, payment
+  "{feature_name}_imp" (format string, sklearn ≥ 1.7)   tenure_imp, charges_imp, calls_imp
+
+With False, the names have to be unique across the whole output. If the same column goes through two
+transformers, you get:
+
+    ValueError: Output feature names: ['tenure'] are not unique.
+    Please set verbose_feature_names_out=True to add prefixes to feature names
+
+An impute-only setup never sends a column through two branches, so False is safe here.
+
+6.4 Gotchas found in testing
+----------------------------
+
+1. Column order changes. Output is grouped by transformer: all numeric columns first, then
+categorical, then remainder. contract moved after calls. ColumnTransformer has no option to keep the
+input order. Outside a pipeline, X_imp[X.columns] fixes it. Inside a pipeline, add a reorder step
+(see the next section).
+
+2. None in an object-dtype column is not imputed. SimpleImputer treats only np.nan as missing. It
+compares values against NaN, so a Python None stays in the output:
+
+  ---------------------------------------------------------------------------------------------------
+  Column                                            Fill result for ["a", None, "a", "b"]
+  ------------------------------------------------- -------------------------------------------------
+  object dtype with None                            ['a', nan, 'a', 'b'] (not filled)
+
+  object dtype with np.nan                          ['a', 'a', 'a', 'b']
+
+  pandas 3 str dtype with None                      ['a', 'a', 'a', 'b'] (pandas already turned None
+                                                    into NaN)
+  ---------------------------------------------------------------------------------------------------
+
+This happened at transform time. A new row whose string column was entirely None was inferred as
+object, and the imputer returned None for it. The fix is X.fillna(np.nan) before imputing.
+
+3. Some dtypes change.
+
+-   The nullable Int64 column came back as float64, and its median fill was 1.5, which is not a
+    valid count. For integer columns, use most_frequent or round afterward.
+-   Categorical columns come back as str. If you need the category dtype back, use
+    .astype("category").
+
+4. All-NaN columns are dropped silently, apart from a warning. A training column with no observed
+values gets "Skipping features without any observed values: ['empty']" and disappears from the
+output. That breaks code that expects the same columns every time. Pass
+SimpleImputer(..., keep_empty_features=True) to keep the column, filled with 0 or an empty string.
+
+5. You can add missingness flags. SimpleImputer(add_indicator=True) appends columns like
+missingindicator_tenure. Missingness itself is often informative.
+
+6.5 Robust version (handles gotchas 1 and 2)
+--------------------------------------------
+
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import FunctionTransformer
+
+    def none_to_nan(X):
+        return X.fillna(np.nan)
+
+    def reorder(X, columns):
+        return X[[c for c in columns if c in X.columns]]
+
+    def reorder_names(transformer, input_features):
+        cols = transformer.kw_args["columns"]
+        return np.asarray([c for c in cols if c in set(input_features)], dtype=object)
+
+    def make_imputer(columns):
+        ct = ColumnTransformer(
+            [("num", SimpleImputer(strategy="median"),        make_column_selector(dtype_include="number")),
+             ("cat", SimpleImputer(strategy="most_frequent"), make_column_selector(dtype_exclude="number"))],
+            remainder="passthrough", verbose_feature_names_out=False)
+        return make_pipeline(
+            FunctionTransformer(none_to_nan, feature_names_out="one-to-one"),
+            ct,
+            FunctionTransformer(reorder, kw_args={"columns": list(columns)},
+                                feature_names_out=reorder_names),
+        ).set_output(transform="pandas")
+
+    imp = make_imputer(X.columns).fit(X)
+
+Details that matter here:
+
+-   Use named functions, not lambdas. A lambda can't be pickled, which breaks joblib, n_jobs=-1, and
+    saving the model. I checked that this version pickles.
+-   The reorder step needs feature_names_out=reorder_names, not "one-to-one". "one-to-one" says the
+    names come out in the same order they went in. With pandas output turned on, sklearn checks that
+    claim and raises "different column names than the ones provided by get_feature_names_out".
+
+Tested result: the original column order is restored, and a new row of all None/NaN values gets
+filled with 8.5, m2m, 57.5, card.
+
+Sources:
+
+-   scikit-learn: Introducing the set_output API
+    https://scikit-learn.org/stable/auto_examples/miscellaneous/plot_set_output.html
+-   scikit-learn: ColumnTransformer
+    https://scikit-learn.org/stable/modules/generated/sklearn.compose.ColumnTransformer.html
+    (verbose_feature_names_out, remainder)
+-   scikit-learn: SimpleImputer
+    https://scikit-learn.org/stable/modules/generated/sklearn.impute.SimpleImputer.html
+    (missing_values, keep_empty_features, add_indicator)
+-   scikit-learn: make_column_selector
+    https://scikit-learn.org/stable/modules/generated/sklearn.compose.make_column_selector.html
+
+----------------------------------------------------------------------------------------------------
+
+7. CHECK_IS_FITTED, UNIQUE_LABELS, INPUT TYPES, AND @PROPERTY
+=============================================================
+
+  Question: When writing a custom scikit-learn classifier, what do check_is_fitted and unique_labels
+  do? How do I handle input that might arrive as a pandas DataFrame, a NumPy array, or a SciPy
+  sparse matrix? When should I expose a fitted value with @property instead of a plain attribute?
+
+Everything below was run against scikit-learn 1.9.1, SciPy 1.18.1, and pandas 3.0.5.
+
+7.1 check_is_fitted
+-------------------
+
+It answers one question: has fit been called on this instance? If not, it raises NotFittedError.
+Here is the core logic from sklearn's source:
+
+    if hasattr(estimator, "__sklearn_is_fitted__"):
+        return estimator.__sklearn_is_fitted__()
+    fitted_attrs = [v for v in vars(estimator) if v.endswith("_") and not v.startswith("__")]
+    return len(fitted_attrs) > 0
+
+So by default, an instance counts as fitted if it has at least one instance attribute whose name
+ends in _, such as classes_ or coef_. That is the practical reason behind the trailing-underscore
+naming rule.
+
+  --------------------------------------------------------------------------------------------------------------------------------
+  Call                                                       Result
+  ---------------------------------------------------------- ---------------------------------------------------------------------
+  check_is_fitted(est) before fit                            NotFittedError: This Toy instance is not fitted yet. Call 'fit' ...
+
+  check_is_fitted(Toy) (the class, not an instance)          TypeError: ... is a class, not an instance
+
+  check_is_fitted(est, attributes=["coef_", "intercept_"])   Requires all of the listed attributes; failed here because there is
+                                                             no intercept_
+
+  ... , all_or_any=any                                       Passes if any one of them exists
+
+  Model that stores only private state (self._w)             False negative: raises even though fit ran
+
+  Same model plus a __sklearn_is_fitted__() method           Uses your method, so it passes
+  --------------------------------------------------------------------------------------------------------------------------------
+
+Where to call it: at the top of every method that needs fitted state (predict, predict_proba,
+decision_function, transform, score), and in fitted-value properties. Call it before
+validate_data(..., reset=False). That way an unfitted estimator gets the clear "not fitted" message
+instead of a confusing feature-count error.
+
+NotFittedError subclasses both ValueError and AttributeError. Because it is an AttributeError,
+hasattr(unfitted, "n_classes_") returns False instead of crashing. sklearn's duck-typing depends on
+this.
+
+7.2 unique_labels
+-----------------
+
+unique_labels(*ys) returns the sorted union of labels across one or more label arrays, and checks
+that the arrays are compatible:
+
+    unique_labels([3, 1, 2], [2, 5])              # [1 2 3 5]  union across arrays
+    unique_labels(np.array(["no", "yes", "no"]))  # ['no' 'yes']
+    unique_labels(np.array([[0,1,1],[1,0,0]]))    # [0 1 2]    multilabel indicator: column indices
+
+It raises on problems that np.unique would let through:
+
+  ---------------------------------------------------------------------------------------------------------------------------
+  Input                                             Error
+  ------------------------------------------------- -------------------------------------------------------------------------
+  ["a","b"] together with [1, 2]                    Mix of label input types (string and number)
+
+  A binary vector together with a multilabel matrix Mix type of y not allowed, got types {'multilabel-indicator', 'binary'}
+
+  [0.5, 1.2] (continuous)                           Unknown label type (this is a regression target)
+  ---------------------------------------------------------------------------------------------------------------------------
+
+Use in fit: self.classes_ = unique_labels(y). It is sorted, as classes_ must be, and it rejects
+continuous targets. In metrics code, unique_labels(y_true, y_pred) gives you the complete label set
+even when a class appears in only one of the two arrays.
+
+np.unique(y, return_counts=True) is fine when you also need class counts, as in the RIPPER wrapper.
+In that case call check_classification_targets(y) first to get the same protection against
+continuous targets.
+
+7.3 Accepting DataFrames, NumPy arrays, and SciPy sparse input
+--------------------------------------------------------------
+
+Use validate_data for all of them. It converts every input to one canonical form and records
+metadata about it:
+
+    def fit(self, X, y):
+        X, y = validate_data(self, X, y, accept_sparse=["csr", "csc"])   # or accept_sparse=False
+        self.classes_ = unique_labels(y)
+        self.coef_ = np.asarray(X.mean(axis=0)).ravel()
+        return self
+
+    def decision_function(self, X):
+        check_is_fitted(self)
+        X = validate_data(self, X, accept_sparse="csr", reset=False)
+        return np.asarray(X @ self.coef_).ravel()
+
+What each input type becomes:
+
+  ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+  Input                             After validate_data                                                                        Metadata recorded
+  --------------------------------- ------------------------------------------------------------------------------------------ -----------------------------------
+  ndarray or Python list            ndarray                                                                                    n_features_in_ = 3
+
+  DataFrame                         ndarray                                                                                    n_features_in_ = 3,
+                                                                                                                               feature_names_in_ = ['a','b','c']
+
+  csr_matrix, csc_array             Kept as is (already an accepted format)                                                    n_features_in_
+
+  coo_matrix / coo_array            Converted to csr_matrix / csr_array (the first format in your list)                        n_features_in_
+
+  Any sparse input with             TypeError: Sparse data was passed for X, but dense data is required. Use '.toarray()'...   n/a
+  accept_sparse=False                                                                                                          
+  ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+What reset=False catches at predict time:
+
+-   Fit on a DataFrame, predict on an array:
+    UserWarning: X does not have valid feature names, but Lin was fitted with feature names.
+-   Same columns in a different order:
+    ValueError: The feature names should match those that were passed during fit. This prevents
+    silently wrong predictions.
+-   Wrong width: ValueError: X has 2 features, but Lin is expecting 3 features as input.
+
+Writing math that works on both dense and sparse input:
+
+-   Use X @ w, or sklearn.utils.extmath.safe_sparse_dot. Never call np.asarray(X) on sparse input;
+    that densifies it, or produces a useless 0-d object array.
+-   Don't use *. On a csr_matrix, X * w is a matrix product ([8, 26]). On a csr_array, it is
+    elementwise and returns a 2×3 result. SciPy is moving toward sparse arrays, so the same *
+    expression can quietly change meaning depending on the input type.
+-   spmatrix.mean(axis=0) returns np.matrix, while sparray.mean(axis=0) returns an ndarray. Wrapping
+    with np.asarray(...).ravel() handles both.
+-   Declare sparse support in your tags: tags.input_tags.sparse = True. check_estimator then tests
+    sparse input instead of expecting a clean rejection.
+
+When the model needs real column dtypes (strings, categoricals, as with RIPPER): the default
+dtype="numeric" raises could not convert string to float. Use validate_data(self, X, y, dtype=None)
+to keep the validation and metadata, and pass the original DataFrame to the model, as the RIPPER
+wrapper did.
+
+7.4 @property vs. a plain attribute
+-----------------------------------
+
+Use a plain attribute (set in fit) for anything the algorithm actually learns: classes_, coef_,
+model_, n_features_in_.
+
+-   Attributes are what check_is_fitted detects. Properties aren't in vars(est), so an estimator
+    whose only fitted values are properties looks unfitted.
+-   They pickle with the model.
+-   Every refit overwrites them, so they never go stale.
+
+Use @property for values derived from fitted state:
+
+    @property
+    def n_classes_(self):
+        check_is_fitted(self)          # unfitted access -> NotFittedError, so hasattr() returns False
+        return len(self.classes_)
+
+Good reasons to use a property:
+
+-   One source of truth. n_classes_, rules_ (the RIPPER wrapper's string view of model_.ruleset_),
+    or feature_importances_ computed from coef_ can never disagree with the attribute they are
+    derived from.
+-   Proxying a wrapped model, such as returning self.model_.something without copying it.
+-   Deprecating or renaming an attribute. The property can emit a FutureWarning and return the new
+    attribute.
+-   Read-only intent. Users can't assign to it by accident.
+
+Two pitfalls I confirmed:
+
+1.  functools.cached_property goes stale on refit. I fit on 3 classes, read n_classes_ (3), then
+    refit on 2 classes, and it still returned 3. The cached value sits in the instance __dict__ and
+    nothing clears it. Use a plain property for cheap values. For expensive ones, compute them in
+    fit and store them as attributes.
+2.  Never make an __init__ parameter a property. set_params(alpha=2) failed with
+    AttributeError: property 'alpha' ... has no setter, which breaks clone and GridSearchCV.
+    Hyperparameters must stay plain attributes.
+
+For methods whose availability depends on a parameter, like SVC with probability=True, use
+sklearn.utils.metaestimators.available_if. It makes hasattr(est, "predict_proba") return False when
+the method can't work. Scorers and VotingClassifier(voting="soft") check exactly that.
+
+Sources:
+
+-   scikit-learn: Developing estimators https://scikit-learn.org/stable/developers/develop.html
+    (fitted attributes, __sklearn_is_fitted__, validate_data)
+-   scikit-learn: check_is_fitted
+    https://scikit-learn.org/stable/modules/generated/sklearn.utils.validation.check_is_fitted.html
+-   scikit-learn: unique_labels
+    https://scikit-learn.org/stable/modules/generated/sklearn.utils.multiclass.unique_labels.html
+-   scikit-learn: available_if
+    https://scikit-learn.org/stable/modules/generated/sklearn.utils.metaestimators.available_if.html
+-   SciPy: sparse arrays vs. sparse matrices https://docs.scipy.org/doc/scipy/reference/sparse.html
+    (the * and @ semantics)
+
+----------------------------------------------------------------------------------------------------
+
+8. EXPORTING THE CONVERSATION AS MARKDOWN
+=========================================
+
+  Question: can you output a markdown document with the entire chat window
+
+I've put the whole conversation into ripper_sklearn_chat.md, about 1,300 lines.
+
+-   Layout: it opens with a linked table of contents. Each of the seven questions is quoted, and my
+    full answer follows it, with all tables, formulas, worked examples and sources.
+-   Code: an appendix at the end holds the four scripts we wrote and tested: ripper_demo.py,
+    ripper_sklearn.py, test_wrapper.py and impute_final.py. That way the document works without the
+    separate files.
+-   What's left out: only the final answers are included. The intermediate installs, debugging runs
+    and test output aren't, apart from the results already quoted in the answers.
+-   Formulas: the equations are written in LaTeX (dollar-sign notation). They render properly in
+    GitHub, Obsidian, Typora and VS Code's preview. Plain text viewers will show the raw notation.
+
+----------------------------------------------------------------------------------------------------
+
+9. EXPORTING THE CONVERSATION AS PLAIN TEXT
+===========================================
+
+  Question: okay i do like that but i need a plain text document with all of my questions and all of
+  your responses
+
+This file is that document: every question and every response from the conversation, converted to
+plain text with no Markdown syntax. Tables are drawn as aligned text, formulas are written in plain
+notation, and the four tested scripts are kept in the appendix.
+
+----------------------------------------------------------------------------------------------------
+
+APPENDIX: CODE FILES
+====================
+
+These are the scripts produced during the conversation, exactly as they were tested (scikit-learn
+1.9.1, pandas 3.0.5, wittgenstein 0.3.5).
+
+ripper_demo.py
+--------------
+
+Section 4: fitting wittgenstein RIPPER, printing rules, predictions, and probabilities.
+
+    import numpy as np
+    import pandas as pd
+    import wittgenstein as lw
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import classification_report, roc_auc_score
+
+    # ---- Synthetic churn data: mixed numeric + categorical, ~imbalanced ----
+    rng = np.random.default_rng(0)
+    n = 2000
+    df = pd.DataFrame({
+        "tenure_months":   rng.integers(1, 72, n),                       # numeric
+        "monthly_charges": rng.normal(70, 25, n).clip(20, 140).round(2), # numeric
+        "contract":        rng.choice(["month-to-month", "one-year", "two-year"], n, p=[.5, .3, .2]),
+        "payment":         rng.choice(["e-check", "card", "bank-transfer"], n),
+        "support_calls":   rng.poisson(1.5, n),                          # numeric, few distinct values
+    })
+    risk = (
+        1.6 * (df.contract == "month-to-month")
+        + 1.2 * (df.tenure_months < 12)
+        + 0.9 * (df.payment == "e-check")
+        + 0.02 * (df.monthly_charges - 70)
+        + 0.5 * (df.support_calls >= 4)
+        - 3.0
+    )
+    df["churn"] = np.where(rng.random(n) < 1 / (1 + np.exp(-risk)), "yes", "no")
+    print(df.churn.value_counts(normalize=True).round(3).to_dict())
+    print(df.dtypes.to_dict(), "\n")
+
+    train, test = train_test_split(df, test_size=0.3, stratify=df.churn, random_state=42)
+    X_test, y_test = test.drop(columns="churn"), test.churn
+
+    # ---- Fit: pass the DataFrame with the label column, name the positive class ----
+    clf = lw.RIPPER(random_state=42)          # defaults: k=2, prune_size=0.33, n_discretize_bins=10
+    clf.fit(train, class_feat="churn", pos_class="yes")
+
+    # ---- Inspect the rules ----
+    print("RULESET:")
+    clf.out_model()
+    print("\nas a string:", clf.ruleset_)
+    print("n rules:", len(clf.ruleset_.rules))
+    print("features used:", clf.selected_features_)
+    print("numeric bins learned:", clf.bin_transformer_.bins_, "\n")
+
+    # ---- Predict ----
+    preds = clf.predict(X_test)               # list of bool: True == pos_class
+    print("first preds:", preds[:8])
+    y_true = (y_test == "yes").tolist()
+    print(classification_report(y_true, preds, target_names=["no", "yes"], digits=3))
+
+    # ---- Probabilities ----
+    proba = clf.predict_proba(X_test)         # shape (n, 2), columns = [neg, pos]
+    print("classes_:", clf.classes_)
+    print("proba[:5]:\n", proba[:5].round(3))
+    print("ROC AUC:", round(roc_auc_score(y_true, proba[:, 1]), 3))
+    print("distinct proba values:", np.unique(proba[:, 1].round(4)).size)
+
+    # ---- Why was a row predicted positive? ----
+    p, reasons = clf.predict(X_test.head(4), give_reasons=True)
+    for row, (pi, ri) in enumerate(zip(p, reasons)):
+        print(row, pi, [str(r) for r in ri])
+
+    # ---- Alternative fit signature: X and y separately ----
+    clf2 = lw.RIPPER(random_state=42, max_rules=4)
+    clf2.fit(train.drop(columns="churn"), train.churn, pos_class="yes")
+    print("\nmax_rules=4:", clf2.ruleset_)
+    print("score (accuracy):", round(clf2.score(X_test, y_test), 3))
+
+ripper_sklearn.py
+-----------------
+
+Section 5: the scikit-learn compatible RipperClassifier wrapper (passes 55/55 applicable estimator
+checks).
+
+    """scikit-learn compatible wrapper around wittgenstein's RIPPER."""
+    import numpy as np
+    import pandas as pd
+    import wittgenstein as lw
+    from sklearn.base import BaseEstimator, ClassifierMixin
+    from sklearn.utils.multiclass import check_classification_targets, type_of_target
+    from sklearn.utils.validation import check_is_fitted, validate_data
+
+
+    class RipperClassifier(ClassifierMixin, BaseEstimator):   # mixin first, BaseEstimator last
+        """Binary RIPPER rule learner with a scikit-learn interface.
+
+        Parameters
+        ----------
+        pos_class : label or None, default=None
+            Class the rules describe. None -> the least frequent class in y.
+        k, prune_size, dl_allowance, n_discretize_bins, max_rules, max_rule_conds,
+        random_state : passed through to wittgenstein.RIPPER.
+        """
+
+        # Rule 1: every argument is an explicit keyword with a default, and the body
+        # only stores it under the same name. No validation, no derived values.
+        def __init__(self, pos_class=None, k=2, prune_size=0.33, dl_allowance=64,
+                     n_discretize_bins=10, max_rules=None, max_rule_conds=None,
+                     random_state=None):
+            self.pos_class = pos_class
+            self.k = k
+            self.prune_size = prune_size
+            self.dl_allowance = dl_allowance
+            self.n_discretize_bins = n_discretize_bins
+            self.max_rules = max_rules
+            self.max_rule_conds = max_rule_conds
+            self.random_state = random_state
+
+        # ---- helpers ----------------------------------------------------------
+        @staticmethod
+        def _as_frame(X_orig, X_checked):
+            """Hand RIPPER the ORIGINAL DataFrame. check_array(dtype=None) turns mixed
+            columns into one object array, and RIPPER only bins numeric-dtype columns."""
+            if isinstance(X_orig, pd.DataFrame):
+                return X_orig.reset_index(drop=True)
+            cols = [f"x{i}" for i in range(X_checked.shape[1])]
+            return pd.DataFrame(X_checked, columns=cols).infer_objects()
+
+        # ---- Rule 2: fit validates, learns attributes ending in "_", returns self
+        def fit(self, X, y):
+            # validate_data: 2-D, non-empty, finite, not sparse, X/y lengths match,
+            # y is not None; records n_features_in_ and feature_names_in_.
+            X_checked, y = validate_data(self, X, y, dtype=None)
+            X = self._as_frame(X, X_checked)
+            check_classification_targets(y)          # rejects continuous / unknown y
+            if np.unique(y).size < 2:     # type_of_target calls a 1-class y "binary"
+                raise ValueError("Classifier can't train when only one class is present.")
+            if type_of_target(y) != "binary":
+                raise ValueError("Only binary classification is supported. The type of the "
+                                 f"target is {type_of_target(y)!r}.")
+
+            # Rule 3: classes_ is sorted, and every output is expressed in its order.
+            self.classes_, counts = np.unique(y, return_counts=True)
+            pos = self.classes_[np.argmin(counts)] if self.pos_class is None else self.pos_class
+            if pos not in self.classes_:
+                raise ValueError(f"pos_class={pos!r} not found in y (classes: {self.classes_}).")
+            self.pos_class_ = pos
+            self.pos_index_ = int(np.flatnonzero(self.classes_ == pos)[0])
+
+            self.model_ = lw.RIPPER(
+                k=self.k, prune_size=self.prune_size, dl_allowance=self.dl_allowance,
+                n_discretize_bins=self.n_discretize_bins, max_rules=self.max_rules,
+                max_rule_conds=self.max_rule_conds, random_state=self.random_state)
+            self.model_.fit(X, pd.Series(y == pos, name="__target__"), pos_class=True)
+            return self
+
+        # ---- Rule 4: predict returns labels from classes_, shape (n_samples,)
+        def predict(self, X):
+            check_is_fitted(self)
+            X = self._as_frame(X, validate_data(self, X, reset=False, dtype=None))
+            fired = np.asarray(self.model_.predict(X), dtype=bool)
+            neg = self.classes_[1 - self.pos_index_]
+            return np.where(fired, self.pos_class_, neg)   # a rule fired -> pos_class
+
+        # ---- Rule 5: predict_proba is (n_samples, n_classes), columns = classes_,
+        # rows sum to 1.
+        def predict_proba(self, X):
+            check_is_fitted(self)
+            X = self._as_frame(X, validate_data(self, X, reset=False, dtype=None))
+            p_pos = np.asarray(self.model_.predict_proba(X))[:, 1]
+            proba = np.empty((len(p_pos), 2))
+            proba[:, self.pos_index_] = p_pos
+            proba[:, 1 - self.pos_index_] = 1.0 - p_pos
+            return proba
+
+        @property
+        def rules_(self):
+            check_is_fitted(self)
+            return str(self.model_.ruleset_)
+
+        # Tags tell sklearn's tools and checks what this estimator accepts.
+        def __sklearn_tags__(self):
+            tags = super().__sklearn_tags__()
+            tags.classifier_tags.multi_class = False
+            tags.input_tags.categorical = True
+            tags.input_tags.string = True
+            return tags
+
+test_wrapper.py
+---------------
+
+Section 5: Pipeline, cross_val_score, GridSearchCV, and the mixin-order demo.
+
+    import warnings; warnings.filterwarnings("ignore")
+    import numpy as np, pandas as pd
+    from sklearn.base import clone, is_classifier, BaseEstimator, ClassifierMixin
+    from sklearn.compose import ColumnTransformer
+    from sklearn.impute import SimpleImputer
+    from sklearn.model_selection import (cross_val_score, GridSearchCV, StratifiedKFold,
+                                         check_cv)
+    from sklearn.pipeline import Pipeline
+    from ripper_sklearn import RipperClassifier
+
+    # same synthetic churn data as before
+    rng = np.random.default_rng(0); n = 2000
+    X = pd.DataFrame({
+        "tenure_months": rng.integers(1, 72, n).astype(float),
+        "monthly_charges": rng.normal(70, 25, n).clip(20, 140).round(2),
+        "contract": rng.choice(["month-to-month", "one-year", "two-year"], n, p=[.5, .3, .2]),
+        "payment": rng.choice(["e-check", "card", "bank-transfer"], n),
+        "support_calls": rng.poisson(1.5, n),
+    })
+    risk = (1.6*(X.contract=="month-to-month") + 1.2*(X.tenure_months<12)
+            + .9*(X.payment=="e-check") + .02*(X.monthly_charges-70) + .5*(X.support_calls>=4) - 3)
+    y = np.where(rng.random(n) < 1/(1+np.exp(-risk)), "yes", "no")
+    X.loc[rng.choice(n, 60, replace=False), "monthly_charges"] = np.nan   # some missing values
+
+    print("== basics ==")
+    clf = RipperClassifier(random_state=0)
+    print(clf)
+    print("is_classifier:", is_classifier(clf))
+    print("get_params:", clf.get_params())
+    print("clone ok:", clone(clf).get_params() == clf.get_params())
+
+    print("\n== Pipeline (impute numeric, pass categoricals through, keep DataFrame) ==")
+    pre = ColumnTransformer(
+        [("num", SimpleImputer(strategy="median"), ["tenure_months", "monthly_charges", "support_calls"])],
+        remainder="passthrough", verbose_feature_names_out=False,
+    ).set_output(transform="pandas")
+    pipe = Pipeline([("pre", pre), ("ripper", RipperClassifier(random_state=0))])
+    pipe.fit(X, y)
+    r = pipe.named_steps["ripper"]
+    print("classes_:", r.classes_, "pos_class_:", r.pos_class_)
+    print("rules:", r.rules_)
+    print("predict:", pipe.predict(X.head(5)), " proba:\n", pipe.predict_proba(X.head(3)).round(3))
+    print("pipe.score (accuracy via ClassifierMixin):", round(pipe.score(X, y), 3))
+
+    print("\n== cross_val_score ==")
+    print("CV splitter chosen for a classifier:", type(check_cv(5, y, classifier=is_classifier(pipe))).__name__)
+    for metric in ["balanced_accuracy", "f1_macro", "roc_auc"]:
+        s = cross_val_score(pipe, X, y, cv=5, scoring=metric, n_jobs=1)
+        print(f"{metric:18s} {s.mean():.3f} ± {s.std():.3f}")
+
+    print("\n== GridSearchCV (nested step__param names) ==")
+    grid = GridSearchCV(
+        pipe,
+        {"ripper__n_discretize_bins": [5, 10], "ripper__prune_size": [0.33, 0.5],
+         "ripper__max_rules": [None, 4]},
+        scoring="balanced_accuracy", cv=StratifiedKFold(4, shuffle=True, random_state=0),
+        n_jobs=-1)
+    grid.fit(X, y)
+    print("best params:", grid.best_params_, "best CV score:", round(grid.best_score_, 3))
+    print("refit best rules:", grid.best_estimator_.named_steps["ripper"].rules_)
+
+    print("\n== wrong mixin order ==")
+    class WrongOrder(BaseEstimator, ClassifierMixin):
+        def fit(self, X, y): return self
+    print("is_classifier(WrongOrder()):", is_classifier(WrongOrder()),
+          "-> CV would use", type(check_cv(5, y, classifier=is_classifier(WrongOrder()))).__name__)
+
+    print("\n== __init__ rule violation ==")
+    class BadInit(ClassifierMixin, BaseEstimator):
+        def __init__(self, bins=10):
+            self.bins = max(2, bins)      # modifies the param
+            self.bins_list_ = []          # derived state in __init__
+    try:
+        clone(BadInit(bins=1))
+    except Exception as e:
+        print(type(e).__name__, ":", str(e)[:160])
+    class KwargsInit(ClassifierMixin, BaseEstimator):
+        def __init__(self, **kwargs): self.kwargs = kwargs
+    try:
+        KwargsInit(a=1).get_params()
+    except Exception as e:
+        print(type(e).__name__, ":", str(e)[:160])
+
+impute_final.py
+---------------
+
+Section 6: impute-only ColumnTransformer with None→NaN handling and column-order restore.
+
+    import pickle, numpy as np, pandas as pd
+    from sklearn.compose import ColumnTransformer, make_column_selector
+    from sklearn.impute import SimpleImputer
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import FunctionTransformer
+
+    def none_to_nan(X):
+        """SimpleImputer treats np.nan, not None, as missing in object columns."""
+        return X.fillna(np.nan)
+
+    def reorder(X, columns):
+        """ColumnTransformer outputs columns grouped by transformer; restore input order."""
+        return X[[c for c in columns if c in X.columns]]
+
+    def reorder_names(transformer, input_features):
+        cols = transformer.kw_args["columns"]
+        return np.asarray([c for c in cols if c in set(input_features)], dtype=object)
+
+    def make_imputer(columns):
+        ct = ColumnTransformer(
+            [("num", SimpleImputer(strategy="median"), make_column_selector(dtype_include="number")),
+             ("cat", SimpleImputer(strategy="most_frequent"), make_column_selector(dtype_exclude="number"))],
+            remainder="passthrough",
+            verbose_feature_names_out=False,
+        )
+        return make_pipeline(
+            FunctionTransformer(none_to_nan, feature_names_out="one-to-one"),
+            ct,
+            FunctionTransformer(reorder, kw_args={"columns": list(columns)}, feature_names_out=reorder_names),
+        ).set_output(transform="pandas")
+
+    X = pd.DataFrame({
+        "tenure":   [1, 5, np.nan, 12, 30],
+        "contract": ["m2m", "one-year", None, "m2m", "two-year"],
+        "charges":  [20.5, np.nan, 70.0, 99.9, 45.0],
+        "payment":  pd.Categorical(["card", None, "card", "e-check", "card"]),
+    }, index=[101, 102, 103, 104, 105])
+
+    imp = make_imputer(X.columns).fit(X)
+    print(imp.transform(X))
+    print("names:", list(imp.get_feature_names_out()))
+    X_new = pd.DataFrame({"tenure":[np.nan], "contract":[None], "charges":[np.nan], "payment":[None]}, index=[999])
+    print(imp.transform(X_new))
+    pickle.loads(pickle.dumps(imp)); print("pickles OK")
