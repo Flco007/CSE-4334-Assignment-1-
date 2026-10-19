@@ -1,0 +1,3 @@
+A decision tree using gini and entropy will split data at each step to try and make its groups as pure as possible. Splits that seperate classes will score as improvements, even if its a small amount.
+these metrics are symmetric. When it comes to ripper you build one rule at a time, and using FOIL gain only trys to make the rile for precise on its targetclass, it will ignore anything the rule does not cover and leave it for the next rule. 
+Rarest-first makes RIPPER spend all its effort describing the rare group with rules that are tested on held-out data, so its minority predictions are more reliable than an unpruned tree’s memorized leaves, at the cost of missing some minority cases its rules don’t cover.
